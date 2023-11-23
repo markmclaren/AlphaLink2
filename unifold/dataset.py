@@ -12,14 +12,11 @@ from unifold.data.process_multimer import (
     pair_and_merge,
     add_assembly_features,
     convert_monomer_features,
-    post_process,
     merge_msas,
 )
-
+import gzip, pickle
 from unicore.data import UnicoreDataset, data_utils
 from unicore.distributed import utils as distributed_utils
-
-import random
 
 Rotation = Iterable[Iterable]
 Translation = Iterable
@@ -29,11 +26,8 @@ TorchExample = Tuple[TorchDict, Optional[List[TorchDict]]]
 
 
 import logging
-import gzip
-import pickle
-import math
 
-logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
+logger = logging.getLogger(__file__)  # pylint: disable=invalid-name
 
 
 def make_data_config(
@@ -70,7 +64,6 @@ def process_label(all_atom_positions: np.ndarray, operation: Operation) -> np.nd
 def load_single_feature(
     sequence_id: str,
     monomer_feature_dir: str,
-    mode: str,
     uniprot_msa_dir: Optional[str] = None,
     is_monomer: bool = False,
 ) -> NumpyDict:
@@ -78,16 +71,10 @@ def load_single_feature(
     monomer_feature = utils.load_pickle(
         os.path.join(monomer_feature_dir, f"{sequence_id}.feature.pkl.gz")
     )
-
-    seq = np.array(list(monomer_feature['sequence'][0].decode("utf-8")))
-
     monomer_feature = convert_monomer_features(monomer_feature)
     chain_feature = {**monomer_feature}
 
-
     if uniprot_msa_dir is not None:
-        if not os.path.isfile(os.path.join(uniprot_msa_dir, f"{sequence_id}.uniprot.pkl.gz")):
-            return chain_feature
         all_seq_feature = utils.load_pickle(
             os.path.join(uniprot_msa_dir, f"{sequence_id}.uniprot.pkl.gz")
         )
@@ -99,9 +86,6 @@ def load_single_feature(
                 all_seq_feature["deletion_matrix"],
             )
         else:
-            # all_seq_feature["deletion_matrix"] = np.asarray(
-            #     all_seq_feature.pop("deletion_matrix_int"), dtype=np.float32
-            # )
             all_seq_feature = utils.convert_all_seq_feature(all_seq_feature)
             for key in [
                 "msa_all_seq",
@@ -128,62 +112,12 @@ def load_single_label(
         for k, v in label.items()
         if k in ["aatype", "all_atom_positions", "all_atom_mask", "resolution"]
     }
-#    print(label['resolution'],label['resolution'].shape)
-    label['resolution'][0] = 3.0
-
     return label
 
-
-def prepare_crosslinks(tp, chain_ids, offsets, lengths):
-    result = []
-    seen = set()
-    for i, chain1 in enumerate(chain_ids):
-        for j, chain2 in enumerate(chain_ids):
-
-            if chain1 not in tp:
-                continue
-
-            if chain2 not in tp[chain1]:
-                continue
-
-            links = []
-
-            for ii, jj,fdr in tp[chain1][chain2]:
-                ii += offsets[i]
-                jj += offsets[j]
-                links.append((ii,jj,fdr))
-
-            if len(links) == 0:
-                continue
-
-            links = torch.tensor(links)
-
-            result.append(links)
-
-
-    return [] if len(result) == 0 else torch.cat(result,dim=0)
-
-def bin_crosslinks(xl,size):
-    buckets = torch.arange(0,1.05,0.05)
-
-    xl = xl[torch.randperm(len(xl))]
-
-    n = size
-    xl_ = np.zeros((n,n,1))
-
-    for i, (r1,r2,fdr) in enumerate(xl):
-        r1 = int(r1.item())
-        r2 = int(r2.item())
-
-        xl_[r1,r2,0] = xl_[r2,r1,0] = torch.bucketize(1-fdr, buckets)
-
-    return xl_
 
 def load(
     sequence_ids: List[str],
     monomer_feature_dir: str,
-    crosslinks: str,
-    mode: str,
     uniprot_msa_dir: Optional[str] = None,
     label_ids: Optional[List[str]] = None,
     label_dir: Optional[str] = None,
@@ -192,30 +126,38 @@ def load(
 ) -> NumpyExample:
 
     all_chain_features = [
-        load_single_feature(s, monomer_feature_dir, mode, uniprot_msa_dir, is_monomer)
+        load_single_feature(s, monomer_feature_dir, uniprot_msa_dir, is_monomer)
         for s in sequence_ids
     ]
 
+    if label_ids is not None:
+        # load labels
+        assert len(label_ids) == len(sequence_ids)
+        assert label_dir is not None
+        if symmetry_operations is None:
+            symmetry_operations = ["I" for _ in label_ids]
+        all_chain_labels = [
+            load_single_label(l, label_dir, o)
+            for l, o in zip(label_ids, symmetry_operations)
+        ]
+        # update labels into features to calculate spatial cropping etc.
+        [f.update(l) for f, l in zip(all_chain_features, all_chain_labels)]
+
     all_chain_features = add_assembly_features(all_chain_features)
 
-    asym_len = np.array([c["seq_length"] for c in all_chain_features], dtype=np.int64)
-
-    offsets = np.cumsum([0] + list(asym_len[:-1]))
-
-    assembly = np.unique([ s.split('_')[0] for s in sequence_ids])[0]
-
-    tp_ = pickle.load(gzip.open(crosslinks,'rb'))
-
-    tp = prepare_crosslinks(tp_, sequence_ids, offsets, asym_len)
-
-    size = np.sum(asym_len)
-   
-    if len(tp) == 0:
-        xl = np.zeros((size,size,1))
-        print("no crosslinks",assembly,len(tp))
+    # get labels back from features, as add_assembly_features may alter the order of inputs.
+    if label_ids is not None:
+        all_chain_labels = [
+            {
+                k: f[k]
+                for k in ["aatype", "all_atom_positions", "all_atom_mask", "resolution"]
+            }
+            for f in all_chain_features
+        ]
     else:
-        xl = bin_crosslinks(tp,size)
+        all_chain_labels = None
 
+    asym_len = np.array([c["seq_length"] for c in all_chain_features], dtype=np.int64)
     if is_monomer:
         all_chain_features = all_chain_features[0]
     else:
@@ -223,13 +165,11 @@ def load(
         all_chain_features = post_process(all_chain_features)
     all_chain_features["asym_len"] = asym_len
 
-    all_chain_features['xl'] = xl
-
-    return all_chain_features, None
+    return all_chain_features, all_chain_labels
 
 
 def process(
-    config: mlc.ConfigDict,
+    config,
     mode: str,
     features: NumpyDict,
     labels: Optional[List[NumpyDict]] = None,
@@ -259,7 +199,6 @@ def process(
 
     if labels is not None:
         features["resolution"] = labels[0]["resolution"].reshape(-1)
-
     with data_utils.numpy_seed(seed, data_idx, key="protein_feature"):
         features["crop_and_fix_size_seed"] = np.random.randint(0, 63355)
         features = utils.filter(features, desired_keys=feature_names)
@@ -272,6 +211,124 @@ def process(
         with torch.no_grad():
             labels = process_labels(labels)
 
+    return features, labels
+
+def calculate_offsets(asym_ids):
+    """A function that calculate the offset when preparing cross link data"""
+    asym_ids = asym_ids.detach().cpu().numpy()
+    unique_asym_ids = np.unique(asym_ids)
+    seq_lens = [np.sum(asym_ids==u) for u in unique_asym_ids]
+    return np.cumsum([0] + seq_lens)
+
+def create_xl_features(xl_pickle,offsets,**kwargs):
+    """
+    Return a n*3 tensor if there is cross-link information
+    Adapted from {Kolja Stahl and Oliver Brock and Juri Rappsilber, 2023, Modelling protein complexes with crosslinking mass spectrometry and deep learning
+    https://github.com/Rappsilber-Laboratory/AlphaLink2/blob/b1cc971f6b0606316852e5fc27b0509e1b15490d/unifold/dataset.py#L137
+    """
+    descriptions = [kwargs['chain_id_map'][k].description for k in kwargs['chain_id_map']] 
+    results = []
+    for i, chain1 in enumerate(descriptions):
+        for j, chain2 in enumerate(descriptions):
+            links = []
+            if chain1 in xl_pickle:
+                if chain2 in xl_pickle[chain1]:
+                    for start,end,fdr in xl_pickle[chain1][chain2]:
+                        start += offsets[i]
+                        end += offsets[j]
+                        links.append((start,end,fdr))
+                    
+                    if len(links)>0:
+                        links = torch.tensor(links)
+                        results.append(links)
+    
+    return [] if len(results) ==0 else torch.cat(results,dim=0)
+
+
+def process_xl_input(features,**kwargs):
+    """Read in and prepare xl pairs"""
+    xl_pickle = pickle.load(gzip.open(kwargs['crosslinks'],'rb'))
+    offsets = calculate_offsets(features['asym_id'])
+    xl= create_xl_features(xl_pickle,offsets,**kwargs)
+    return xl
+
+def bin_xl(xl,num_res):
+    """
+    Put each link from the xl tensors to its bin
+    Adapted from {Kolja Stahl and Oliver Brock and Juri Rappsilber, 2023, Modelling protein complexes with crosslinking mass spectrometry and deep learning
+    https://github.com/Rappsilber-Laboratory/AlphaLink2/blob/b1cc971f6b0606316852e5fc27b0509e1b15490d/unifold/dataset.py#L166
+    """
+    bins = torch.arange(0,1.05,0.05)
+    xl = xl[torch.randperm(len(xl))]
+    output = np.zeros((num_res,num_res,1))
+    for i, (r1,r2,fdr) in enumerate(xl):
+        r1 = int(r1.item())
+        r2 = int(r2.item())    
+        output[r1,r2,0] = output[r2,r1,0] = torch.bucketize(1-fdr, bins)
+    
+    return output
+
+def process_ap(
+    config,
+    mode: str,
+    features: NumpyDict,
+    labels: Optional[List[NumpyDict]] = None,
+    seed: int = 0,
+    batch_idx: Optional[int] = None,
+    is_distillation: bool = False,
+    crosslinks: str = None,
+    **kwargs
+) -> TorchExample:
+
+    if mode == "train":
+        assert batch_idx is not None
+        with data_utils.numpy_seed(seed, batch_idx, key="recycling"):
+            num_iters = np.random.randint(0, config.common.max_recycling_iters + 1)
+            use_clamped_fape = np.random.rand() < config[mode].use_clamped_fape_prob
+    else:
+        num_iters = config.common.max_recycling_iters
+        use_clamped_fape = 1
+
+    features["num_recycling_iters"] = int(num_iters)
+    features["use_clamped_fape"] = int(use_clamped_fape)
+    features["is_distillation"] = int(is_distillation)
+    if is_distillation and "msa_chains" in features:
+        features.pop("msa_chains")
+
+    num_res = int(features["seq_length"])
+    cfg, feature_names = make_data_config(config, mode=mode, num_res=num_res)
+    feature_names += ['asym_id','entity_id','sym_id','template_all_atom_mask','template_aatype','template_all_atom_positions']
+    if labels is not None:
+        features["resolution"] = labels[0]["resolution"].reshape(-1)
+    
+    with data_utils.numpy_seed(seed=seed, key="protein_feature"):
+        features["crop_and_fix_size_seed"] = np.random.randint(0, 63355)
+        features = utils.filter(features, desired_keys=feature_names)
+        features = {k: torch.tensor(v) for k, v in features.items()}
+        features["template_mask"] = torch.ones(
+        features["template_aatype"].shape[-1], dtype=torch.float32
+    ).reshape(1,-1)
+        cfg.common.use_template = True
+        with torch.no_grad():
+            features = process_features(features, cfg.common, cfg[mode])
+
+    if labels is not None:
+        labels = [{k: torch.tensor(v) for k, v in l.items()} for l in labels]
+        with torch.no_grad():
+            labels = process_labels(labels)
+
+    if crosslinks is not None:
+        xl = process_xl_input(features,
+                              crosslinks=crosslinks,
+                              chain_id_map=kwargs['chain_id_map'])
+        
+        if len(xl) == 0:
+            xl = np.zeros((num_res,num_res,1))
+        else:
+            xl = bin_xl(xl,num_res)
+        features['xl'] = torch.unsqueeze(torch.tensor(xl),0)
+    else:
+        features['xl'] =  torch.tensor(np.zeros((num_res,num_res,1)))
     return features, labels
 
 
@@ -289,12 +346,10 @@ def load_and_process(
         if "is_monomer" not in load_kwargs
         else load_kwargs.pop("is_monomer")
     )
-    features, labels = load(**load_kwargs, mode=mode, is_monomer=is_monomer)
+    features, labels = load(**load_kwargs, is_monomer=is_monomer)
     features, labels = process(
         config, mode, features, labels, seed, batch_idx, data_idx, is_distillation
     )
-    #print(features.keys())
-    #print("MSA size", features["msa_feat"].shape, features["template_aatype"].shape, features["xl"].shape)
     return features, labels
 
 
@@ -311,7 +366,7 @@ class UnifoldDataset(UnicoreDataset):
         json_prefix="",
     ):
         self.path = data_path
-
+        disable_sd = True
         def load_json(filename):
             return json.load(open(filename, "r"))
 
@@ -333,8 +388,6 @@ class UnifoldDataset(UnicoreDataset):
             )
         )
         self.feature_path = os.path.join(self.path, "pdb_features")
-        self.crosslink_path = os.path.join(self.path, "crosslinks")
-
         self.label_path = os.path.join(self.path, "pdb_labels")
         sd_sample_weight_path = os.path.join(
             self.path, json_prefix + "sd_train_sample_weight.json"
@@ -353,13 +406,11 @@ class UnifoldDataset(UnicoreDataset):
             * distributed_utils.get_data_parallel_world_size()
             * args.update_freq[0]
         )
-
         self.data_len = (
             max_step * self.batch_size
             if max_step is not None
             else len(self.sample_weight)
         )
-
         self.mode = mode
         self.num_seq, self.seq_keys, self.seq_sample_prob = self.cal_sample_weight(
             self.seq_sample_weight
@@ -367,11 +418,6 @@ class UnifoldDataset(UnicoreDataset):
         self.num_chain, self.chain_keys, self.sample_prob = self.cal_sample_weight(
             self.sample_weight
         )
-
-#        self.data_len = self.num_seq
-
-
-
         if self.sd_sample_weight is not None:
             (
                 self.sd_num_chain,
@@ -419,21 +465,13 @@ class UnifoldDataset(UnicoreDataset):
         return seq_name, label_name, is_distillation
 
     def __getitem__(self, idx):
-        #print(self.mode, idx)
-        if self.mode == "train":
-            sequence_id = self.seq_keys[idx]
-            label_id = np.random.choice(self.multi_label[sequence_id])
-        else:
-            label_id = self.chain_keys[idx]
-            sequence_id = self.inverse_multi_label[label_id]
-
-        is_distillation = False
-
-
-        feature_dir, crosslink_dir, label_dir = (
-            (self.feature_path, self.crosslink_path, self.label_path)
+        sequence_id, label_id, is_distillation = self.sample_chain(
+            idx, sample_by_seq=True
+        )
+        feature_dir, label_dir = (
+            (self.feature_path, self.label_path)
             if not is_distillation
-            else (self.sd_feature_path, self.crosslink_path, self.sd_label_path)
+            else (self.sd_feature_path, self.sd_label_path)
         )
         features, _ = load_and_process(
             self.config,
@@ -444,7 +482,6 @@ class UnifoldDataset(UnicoreDataset):
             is_distillation=is_distillation,
             sequence_ids=[sequence_id],
             monomer_feature_dir=feature_dir,
-            crosslinks=crosslink_dir,
             uniprot_msa_dir=None,
             label_ids=[label_id],
             label_dir=label_dir,
@@ -496,16 +533,13 @@ class UnifoldMultimerDataset(UnifoldDataset):
             open(os.path.join(self.data_path, json_prefix + "pdb_assembly.json"))
         )
         self.pdb_chains = self.get_chains(self.inverse_multi_label)
-
         self.monomer_feature_path = os.path.join(self.data_path, "pdb_features")
         self.uniprot_msa_path = os.path.join(self.data_path, "pdb_uniprots")
         self.label_path = os.path.join(self.data_path, "pdb_labels")
-        self.crosslink_path_tp = os.path.join(self.path, "sulfo_sda_xl_tp")
-        self.crosslink_path_fp = os.path.join(self.path, "sulfo_sda_xl_fp")
         self.max_chains = args.max_chains
         if self.mode == "train":
             self.pdb_chains, self.sample_weight = self.filter_pdb_by_max_chains(
-                self.pdb_chains, self.pdb_assembly, self.sample_weight, self.max_chains
+                self.pdb_chains, self.pdb_assembly, self.sample_weight, self.max_chains,self.inverse_multi_label
             )
             self.num_chain, self.chain_keys, self.sample_prob = self.cal_sample_weight(
                 self.sample_weight
@@ -513,6 +547,7 @@ class UnifoldMultimerDataset(UnifoldDataset):
 
     def __getitem__(self, idx):
         seq_id, label_id, is_distillation = self.sample_chain(idx)
+        is_distillation = False
         if is_distillation:
             label_ids = [label_id]
             sequence_ids = [seq_id]
@@ -523,6 +558,7 @@ class UnifoldMultimerDataset(UnifoldDataset):
             )
             symmetry_operations = None
         else:
+            
             pdb_id = self.get_pdb_name(label_id)
             if pdb_id in self.pdb_assembly and self.mode == "train":
                 label_ids = [
@@ -535,12 +571,10 @@ class UnifoldMultimerDataset(UnifoldDataset):
             sequence_ids = [
                 self.inverse_multi_label[chain_id] for chain_id in label_ids
             ]
-
-            monomer_feature_path, uniprot_msa_path, label_path, crosslink_dir= (
+            monomer_feature_path, uniprot_msa_path, label_path = (
                 self.monomer_feature_path,
                 self.uniprot_msa_path,
                 self.label_path,
-                self.crosslink_path,
             )
 
         return load_and_process(
@@ -552,7 +586,6 @@ class UnifoldMultimerDataset(UnifoldDataset):
             is_distillation=is_distillation,
             sequence_ids=sequence_ids,
             monomer_feature_dir=monomer_feature_path,
-            crosslinks=crosslink_dir,
             uniprot_msa_dir=uniprot_msa_path,
             label_ids=label_ids,
             label_dir=label_path,
@@ -590,13 +623,22 @@ class UnifoldMultimerDataset(UnifoldDataset):
         return pdb_chains
 
     @staticmethod
-    def filter_pdb_by_max_chains(pdb_chains, pdb_assembly, sample_weight, max_chains):
+    def filter_pdb_by_max_chains(pdb_chains, pdb_assembly, sample_weight, max_chains,inverse_labels):
+        def list_overlaps(a,b):
+            """check if all chains in one pdb id exist in inversed labels"""
+            for i in a:
+                if i not in b:
+                    return False
+            return True
         new_pdb_chains = {}
         for chain in pdb_chains:
             if chain in pdb_assembly:
                 size = len(pdb_assembly[chain]["chains"])
                 if size <= max_chains:
-                    new_pdb_chains[chain] = pdb_chains[chain]
+                    curr_chains = [f"{chain}_{chain_id}" for chain_id in pdb_assembly[chain]['chains']]
+                    if list_overlaps(curr_chains,inverse_labels.keys()):
+                        new_pdb_chains[chain] = pdb_chains[chain]
+                        new_pdb_chains[chain] = pdb_chains[chain]
             else:
                 size = len(pdb_chains[chain])
                 if size == 1:
