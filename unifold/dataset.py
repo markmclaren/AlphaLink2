@@ -12,7 +12,7 @@ from unifold.data.process_multimer import (
     pair_and_merge,
     add_assembly_features,
     convert_monomer_features,
-    merge_msas,
+    merge_msas,post_process
 )
 import gzip, pickle
 from unicore.data import UnicoreDataset, data_utils
@@ -280,6 +280,7 @@ def process_ap(
     **kwargs
 ) -> TorchExample:
 
+    chain_id_map = kwargs['chain_id_map']
     if mode == "train":
         assert batch_idx is not None
         with data_utils.numpy_seed(seed, batch_idx, key="recycling"):
@@ -310,6 +311,7 @@ def process_ap(
     ).reshape(1,-1)
         cfg.common.use_template = True
         with torch.no_grad():
+            features['assembly_num_chains'] = torch.tensor([len(chain_id_map)])
             features = process_features(features, cfg.common, cfg[mode])
 
     if labels is not None:
