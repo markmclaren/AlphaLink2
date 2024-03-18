@@ -12,7 +12,7 @@ from unifold.data.data_ops import get_pairwise_distances
 from unifold.data import residue_constants as rc
 import torch
 from alphafold.relax import relax
-from alphapulldown.plot_pae import plot_pae_from_matrix
+from alphapulldown.utils.plotting import plot_pae_from_matrix
 import math,time
 import numpy as np
 import pickle,gzip,os,json
