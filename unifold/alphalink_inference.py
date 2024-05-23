@@ -15,7 +15,7 @@ from alphafold.relax import relax
 from alphapulldown.utils.plotting import plot_pae_from_matrix
 import math,time
 import numpy as np
-import pickle,gzip,os,json
+import pickle,gzip,os,json, re
 from unifold.dataset import process_ap
 # from https://github.com/deepmind/alphafold/blob/main/run_alphafold.py
 
@@ -103,9 +103,21 @@ def remove_recycling_dimensions(batch, out):
         out = tensor_tree_map(lambda x: np.array(x.cpu()), out)
         return batch, out
 
+def check_resume_status(curr_model_name, output_dir):
+    pattern = r'_(\d+\.\d+)\.pdb$'
+    curr_pdb_file = [i for i in os.listdir(output_dir) if i.startswith(curr_model_name) and i.endswith(".pdb")]
+    if len(curr_pdb_file) ==1:
+        matched = re.search(pattern, curr_pdb_file[0])
+        iptm_value = float(matched.group(1))
+        already_exists = True
+    else:
+        iptm_value = None
+        already_exists = False
+    return already_exists, iptm_value
+
 def predict_iterations(feature_dict,output_dir='',param_path='',input_seqs=[],
                        configs=None,crosslinks='',chain_id_map=None,
-                       num_inference = 10,
+                       num_inference = 10, resume = True,
                        cutoff = 25):
     plddts = {}
     best_out = None
@@ -119,80 +131,84 @@ def predict_iterations(feature_dict,output_dir='',param_path='',input_seqs=[],
     
     for it in range(num_inference):
         cur_seed = hash((DATA_RANDOM_SEED, it)) % 100000
-        batch,_ = process_ap(config=configs.data,
-                           features=feature_dict,
-                           mode="predict",labels=None,
-                           seed=cur_seed,batch_idx=None,
-                           data_idx=None,is_distillation=False,
-                           chain_id_map = chain_id_map,
-                           crosslinks = crosslinks)
-        # faster prediction with large chunk/block size
-        seq_len = batch["aatype"].shape[-1]
-        chunk_size, block_size = automatic_chunk_size(
-                                    seq_len,
-                                    model_device
-                                )
-        model.globals.chunk_size = chunk_size
-        model.globals.block_size = block_size
+        curr_model_name = f"AlphaLink2_model_{it}_seed_{cur_seed}"
+        already_exists, iptm_value = check_resume_status(curr_model_name, output_dir)
+        if resume and already_exists:
+            print(f"{curr_model_name} already modelled with iptm: {iptm_value}. Skipped.")
+            continue
+        else:
+            batch,_ = process_ap(config=configs.data,
+                            features=feature_dict,
+                            mode="predict",labels=None,
+                            seed=cur_seed,batch_idx=None,
+                            data_idx=None,is_distillation=False,
+                            chain_id_map = chain_id_map,
+                            crosslinks = crosslinks)
+            # faster prediction with large chunk/block size
+            seq_len = batch["aatype"].shape[-1]
+            chunk_size, block_size = automatic_chunk_size(
+                                        seq_len,
+                                        model_device
+                                    )
+            model.globals.chunk_size = chunk_size
+            model.globals.block_size = block_size
 
-        with torch.no_grad():
-            batch = {
-                k: torch.as_tensor(v, device=model_device)
-                for k, v in batch.items()
-            }
-
-            t = time.perf_counter()
-            torch.autograd.set_detect_anomaly(True)
-            raw_out = model(batch)
-            print(f"Inference time: {time.perf_counter() - t}")
-            score = ["plddt", "ptm", "iptm", "iptm+ptm",'predicted_aligned_error']
-            out = {
-                    k: v for k, v in raw_out.items()
-                    if k.startswith("final_") or k in score
+            with torch.no_grad():
+                batch = {
+                    k: torch.as_tensor(v, device=model_device)
+                    for k, v in batch.items()
                 }
-            batch, out = remove_recycling_dimensions(batch,out)
-            ca_idx = rc.atom_order["CA"]
-            ca_coords = torch.from_numpy(out["final_atom_positions"][..., ca_idx, :])
-            distances = get_pairwise_distances(ca_coords)#[0]#[0,0]
-            xl = torch.from_numpy(batch['xl'][...,0].astype(np.int32) > 0)
-            interface = torch.from_numpy(batch['asym_id'][..., None] != batch['asym_id'][..., None, :])
-            satisfied = torch.sum(distances[xl[0] & interface[0]] <= cutoff) / 2
-            total_xl = torch.sum(xl & interface) / 2
-            if np.mean(out["iptm+ptm"]) > best_iptm:
-                best_iptm = np.mean(out["iptm+ptm"])
-                best_out = out
-                best_seed = cur_seed           
-            print("Current seed: %d Model %d Crosslink satisfaction: %.3f Model confidence: %.3f" %(cur_seed,it,satisfied / total_xl, np.mean(out["iptm+ptm"])))
-            plddt = out["plddt"]
-            mean_plddt = np.mean(plddt)
-            plddt_b_factors = np.repeat(
-                plddt[..., None], residue_constants.atom_type_num, axis=-1
-            )
-            cur_protein = protein.from_prediction(
-                features=batch, result=out, b_factors=plddt_b_factors
-            )
-            iptm_str = np.mean(out["iptm+ptm"])
 
-            cur_save_name = (
-                f"AlphaLink2_model_{it}_seed_{cur_seed}_{iptm_str:.3f}.pdb"
+                t = time.perf_counter()
+                torch.autograd.set_detect_anomaly(True)
+                raw_out = model(batch)
+                print(f"Inference time: {time.perf_counter() - t}")
+                score = ["plddt", "ptm", "iptm", "iptm+ptm",'predicted_aligned_error']
+                out = {
+                        k: v for k, v in raw_out.items()
+                        if k.startswith("final_") or k in score
+                    }
+                batch, out = remove_recycling_dimensions(batch,out)
+                ca_idx = rc.atom_order["CA"]
+                ca_coords = torch.from_numpy(out["final_atom_positions"][..., ca_idx, :])
+                distances = get_pairwise_distances(ca_coords)#[0]#[0,0]
+                xl = torch.from_numpy(batch['xl'][...,0].astype(np.int32) > 0)
+                interface = torch.from_numpy(batch['asym_id'][..., None] != batch['asym_id'][..., None, :])
+                satisfied = torch.sum(distances[xl[0] & interface[0]] <= cutoff) / 2
+                total_xl = torch.sum(xl & interface) / 2
+                if np.mean(out["iptm+ptm"]) > best_iptm:
+                    best_iptm = np.mean(out["iptm+ptm"])
+                    best_out = out
+                    best_seed = cur_seed           
+                print("Current seed: %d Model %d Crosslink satisfaction: %.3f Model confidence: %.3f" %(cur_seed,it,satisfied / total_xl, np.mean(out["iptm+ptm"])))
+                plddt = out["plddt"]
+                plddt_b_factors = np.repeat(
+                    plddt[..., None], residue_constants.atom_type_num, axis=-1
+                )
+                cur_protein = protein.from_prediction(
+                    features=batch, result=out, b_factors=plddt_b_factors
+                )
+                iptm_value = np.mean(out["iptm+ptm"])
+                cur_save_name = (
+                f"AlphaLink2_model_{it}_seed_{cur_seed}_{iptm_value:.3f}.pdb"
             )
-            cur_plot_name = f"AlphaLink2_model_{it}_seed_{cur_seed}_{iptm_str:.3f}_pae.png"
-            # plot PAE
-            plot_pae_from_matrix(input_seqs,
-                                 pae_matrix=out['predicted_aligned_error'],
-                                 figure_name=os.path.join(output_dir, cur_plot_name))
-            cur_protein.chain_index = np.squeeze(cur_protein.chain_index,0)
-            cur_protein.aatype = np.squeeze(cur_protein.aatype,0)
-            unique_asym_ids = np.unique(cur_protein.chain_index)
-            seq_lens = [np.sum(cur_protein.chain_index==u) for u in unique_asym_ids]
-            residue_index = []
-            for seq_len in seq_lens:
-                residue_index += range(seq_len)
-            cur_protein.residue_index = np.array(residue_index)
-            with open(os.path.join(output_dir, cur_save_name), "w") as f:
-                f.write(protein.to_pdb(cur_protein))
-            
-            del out
+                cur_plot_name = f"AlphaLink2_model_{it}_seed_{cur_seed}_{iptm_value:.3f}_pae.png"
+                # plot PAE
+                plot_pae_from_matrix(input_seqs,
+                                    pae_matrix=out['predicted_aligned_error'],
+                                    figure_name=os.path.join(output_dir, cur_plot_name))
+                cur_protein.chain_index = np.squeeze(cur_protein.chain_index,0)
+                cur_protein.aatype = np.squeeze(cur_protein.aatype,0)
+                unique_asym_ids = np.unique(cur_protein.chain_index)
+                seq_lens = [np.sum(cur_protein.chain_index==u) for u in unique_asym_ids]
+                residue_index = []
+                for seq_len in seq_lens:
+                    residue_index += range(seq_len)
+                cur_protein.residue_index = np.array(residue_index)
+                with open(os.path.join(output_dir, cur_save_name), "w") as f:
+                    f.write(protein.to_pdb(cur_protein))
+                
+                del out
 
     return best_out, best_seed, plddts
 
